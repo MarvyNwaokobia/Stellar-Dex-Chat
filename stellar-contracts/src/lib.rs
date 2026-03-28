@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
+    Symbol,
 };
 
 pub mod oracle;
@@ -12,6 +13,7 @@ const MAX_REFERENCE_LEN: u32 = 64;
 const WINDOW_LEDGERS: u32 = 17_280; // ~24 hours
 const MIN_TIMELOCK_DELAY: u32 = 34_560; // 48 hours
 const DEFAULT_INACTIVITY_THRESHOLD: u32 = 1_555_200; // ~3 months
+const MIN_UPGRADE_DELAY: u32 = 1_000;
 
 // ── Error codes ───────────────────────────────────────────────────────────
 #[contracterror]
@@ -51,6 +53,9 @@ pub enum Error {
     ActionNotReady = 602,
     InactivityThresholdNotReached = 603,
     NoEmergencyRecoveryAddress = 604,
+    UpgradeNotReady = 605,
+    UpgradeProposalMissing = 606,
+    UpgradeDelayTooShort = 607,
 
     // --- 700 series: External Services ---
     OracleNotSet = 701,
@@ -106,6 +111,13 @@ pub struct UserDailyVolume {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeProposal {
+    pub wasm_hash: BytesN<32>,
+    pub executable_after: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigSnapshot {
     pub admin: Address,
     pub pending_admin: Option<Address>,
@@ -154,6 +166,8 @@ pub enum DataKey {
     FiatLimit,
     UserDailyVolume(Address),
     AntiSandwichDelay,
+    UpgradeProposal,
+    UpgradeDelay,
 }
 
 const ORACLE_PRICE_DECIMALS: i128 = 10_000_000;
@@ -192,6 +206,9 @@ impl FiatBridge {
         env.storage()
             .instance()
             .set(&DataKey::AntiSandwichDelay, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeDelay, &MIN_UPGRADE_DELAY);
 
         env.storage().instance().extend_ttl(MIN_TTL, MAX_TTL);
         Ok(())
@@ -697,6 +714,88 @@ impl FiatBridge {
         Ok(())
     }
 
+    pub fn set_upgrade_delay(env: Env, ledgers: u32) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        if ledgers < MIN_UPGRADE_DELAY {
+            return Err(Error::UpgradeDelayTooShort);
+        }
+
+        env.storage().instance().set(&DataKey::UpgradeDelay, &ledgers);
+        Ok(())
+    }
+
+    pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        let delay: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeDelay)
+            .unwrap_or(MIN_UPGRADE_DELAY);
+
+        let proposal = UpgradeProposal {
+            wasm_hash: new_wasm_hash.clone(),
+            executable_after: env.ledger().sequence().saturating_add(delay),
+        };
+
+        env.storage().instance().set(&DataKey::UpgradeProposal, &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "upg_prop"),),
+            (new_wasm_hash, proposal.executable_after),
+        );
+        Ok(())
+    }
+
+    pub fn execute_upgrade(env: Env) -> Result<(), Error> {
+        let proposal: UpgradeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(Error::UpgradeProposalMissing)?;
+
+        if env.ledger().sequence() < proposal.executable_after {
+            return Err(Error::UpgradeNotReady);
+        }
+
+        env.deployer()
+            .update_current_contract_wasm(proposal.wasm_hash.clone());
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        env.events()
+            .publish((Symbol::new(&env, "upg_exec"),), proposal.wasm_hash);
+        Ok(())
+    }
+
+    pub fn cancel_upgrade(env: Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        let proposal: UpgradeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal)
+            .ok_or(Error::UpgradeProposalMissing)?;
+
+        env.storage().instance().remove(&DataKey::UpgradeProposal);
+        env.events()
+            .publish((Symbol::new(&env, "upg_can"),), proposal.wasm_hash);
+        Ok(())
+    }
+
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -967,6 +1066,17 @@ impl FiatBridge {
             .instance()
             .get(&DataKey::AntiSandwichDelay)
             .unwrap_or(0)
+    }
+
+    pub fn get_upgrade_delay(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeDelay)
+            .unwrap_or(MIN_UPGRADE_DELAY)
+    }
+
+    pub fn get_upgrade_proposal(env: Env) -> Option<UpgradeProposal> {
+        env.storage().instance().get(&DataKey::UpgradeProposal)
     }
 
     pub fn get_total_withdrawn(env: Env) -> Result<i128, Error> {

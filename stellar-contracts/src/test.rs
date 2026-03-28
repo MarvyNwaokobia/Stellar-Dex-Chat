@@ -5,7 +5,7 @@ use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Bytes, Env,
+    Address, Bytes, BytesN, Env,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────
@@ -42,6 +42,32 @@ fn setup_bridge(
     let (token_addr, token, token_sac) = create_token(env, &token_admin);
     bridge.init(&admin, &token_addr, &limit);
     (contract_id, bridge, admin, token_addr, token, token_sac)
+}
+
+fn load_valid_contract_wasm_fixture() -> std::vec::Vec<u8> {
+    let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| std::string::String::from("."));
+        let mut path = home;
+        path.push_str("/.cargo");
+        path
+    });
+
+    let registry_src = std::path::Path::new(&cargo_home).join("registry/src");
+    let entries = std::fs::read_dir(&registry_src).expect("unable to read cargo registry/src");
+
+    for entry in entries.flatten() {
+        let registry_path = entry.path();
+        if !registry_path.is_dir() {
+            continue;
+        }
+
+        let candidate = registry_path.join("soroban-sdk-25.3.0/doctest_fixtures/contract.wasm");
+        if candidate.exists() {
+            return std::fs::read(candidate).expect("unable to read fixture wasm");
+        }
+    }
+
+    panic!("soroban-sdk doctest wasm fixture not found")
 }
 
 // ── happy-path tests ──────────────────────────────────────────────────
@@ -535,4 +561,76 @@ fn test_slippage_violation_reverts() {
     // Now allow it with 600 bps threshold
     bridge.deposit(&user, &1000, &token_addr, &Bytes::new(&env), &expected_price, &600);
     assert_eq!(token.balance(&user), 4000);
+}
+
+#[test]
+fn test_execute_upgrade_before_delay_fails_with_upgrade_not_ready() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, _, _, _, _) = setup_bridge(&env, 500);
+
+    let proposed_wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    bridge.propose_upgrade(&proposed_wasm_hash);
+
+    let result = bridge.try_execute_upgrade();
+    assert_eq!(result, Err(Ok(Error::UpgradeNotReady)));
+}
+
+#[test]
+fn test_cancel_upgrade_removes_pending_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, _, _, _, _) = setup_bridge(&env, 500);
+
+    let proposed_wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    bridge.propose_upgrade(&proposed_wasm_hash);
+    assert!(bridge.get_upgrade_proposal().is_some());
+
+    bridge.cancel_upgrade();
+    assert!(bridge.get_upgrade_proposal().is_none());
+
+    let result = bridge.try_execute_upgrade();
+    assert_eq!(result, Err(Ok(Error::UpgradeProposalMissing)));
+}
+
+#[test]
+fn test_upgrade_delay_cannot_be_below_minimum() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, _, _, _, _) = setup_bridge(&env, 500);
+
+    let zero_delay = bridge.try_set_upgrade_delay(&0);
+    assert_eq!(zero_delay, Err(Ok(Error::UpgradeDelayTooShort)));
+
+    let below_min = bridge.try_set_upgrade_delay(&999);
+    assert_eq!(below_min, Err(Ok(Error::UpgradeDelayTooShort)));
+
+    bridge.set_upgrade_delay(&1000);
+    assert_eq!(bridge.get_upgrade_delay(), 1000);
+}
+
+#[test]
+fn test_execute_upgrade_after_delay_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_, bridge, _, _, _, _) = setup_bridge(&env, 500);
+    bridge.set_upgrade_delay(&1000);
+
+    let fixture_wasm = load_valid_contract_wasm_fixture();
+    let wasm_hash = env
+        .deployer()
+        .upload_contract_wasm(Bytes::from_slice(&env, fixture_wasm.as_slice()));
+    bridge.propose_upgrade(&wasm_hash);
+
+    let start = env.ledger().sequence();
+    env.ledger().with_mut(|li| {
+        li.sequence_number = start + 1000;
+    });
+
+    let result = bridge.try_execute_upgrade();
+    assert_eq!(result, Ok(Ok(())));
 }

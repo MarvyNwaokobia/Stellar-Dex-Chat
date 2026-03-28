@@ -633,6 +633,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "UpgradeDelay"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1000
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "UserDeposited"
                           },
                           {

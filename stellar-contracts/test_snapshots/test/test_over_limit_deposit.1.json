@@ -247,6 +247,18 @@
                       "val": {
                         "address": "CCABDO7UZXYE4W6GVSEGSNNZTKSLFQGKXXQTH6OX7M7GKZ4Z6CUJNGZN"
                       }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "UpgradeDelay"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1000
+                      }
                     }
                   ]
                 }
